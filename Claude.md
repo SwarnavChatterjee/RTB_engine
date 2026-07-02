@@ -713,55 +713,41 @@ new info):**
 
 ---
 
-**Phase 1, Step 3 IN PROGRESS: `ArenaAllocator`**
 
-- Mental model established: per-request bump allocator. One heap slab
-  allocated once at construction (`new char[capacity]`), a single
-  `offset_` cursor that advances on each `allocate()`, and `reset()`
-  which just sets `offset_ = 0` — O(1) "free everything," no
-  individual-object bookkeeping, because every object allocated during
-  one bid request shares the same lifetime (the request itself).
-- Backing memory location decided: **heap**, not stack or static/global.
-  Stack ruled out (size limits, compile-time-constant requirement, risk
-  of overflow). Static/global ruled out (data race risk if v2 ever adds
-  concurrency — see Section 2b). Heap allocation happens once in the
-  constructor; the per-request cost that matters is just pointer
-  arithmetic afterward.
-- Overflow handling decided: **`assert`, not `nullptr` and not
-  `bad_alloc`.** Reasoning: arena size is a known, fixed parameter
-  chosen upfront based on expected per-request memory needs; overflow
-  represents a sizing bug to catch in testing, not a runtime condition
-  to gracefully handle on the hot path. `nullptr` requires every caller
-  to remember to check (easy to forget, crashes later and far from the
-  cause). `bad_alloc` adds exception-handling overhead on a 5ms-budget
-  hot path. `assert` is zero-cost in release builds and fails loudly in
-  debug/test builds — standard pattern in game engines / HFT systems for
-  this exact bump-allocator use case.
-- `.hpp` and `.cpp` written (deviated from strict block-by-block working
-  mode this once — written in full, with a complete manual dry run
-  walked through instead, covering: unaligned single-byte alloc, aligned
-  8-byte double alloc showing padding bytes, aligned 4-byte alloc with
-  no padding needed, `reset()` behavior (cursor only, memory NOT zeroed
-  — callers must not assume clean memory after reset), and an overflow
-  case triggering the assert). Class is non-copyable (`= delete` on copy
-  ctor/assign) since two arenas sharing one slab would be a correctness
-  bug.
-- Key implementation detail to remember: alignment is done via bitmask
-  rounding — `(addr + alignment - 1) & ~(alignment - 1)` — which only
-  works correctly when `alignment` is a power of two (true for all
-  realistic alignments: 1, 2, 4, 8, 16...).
-- **Not yet compiled or tested.** Still need a
-  `tests/test_arena_allocator.cpp` following the same pattern as
-  `BidRequest`'s test suite before this is considered done.
+**Phase 1, Step 3 COMPLETE: `ArenaAllocator` written, reviewed, tests written.**
+- `.hpp` and `.cpp` complete — see design rationale above.
+- `tests/test_arena_allocator.cpp` written (13 tests).
+- NOT yet compiled or run — blocked on teammate's MinGW upgrade to g++ 13+
+  via MSYS2. Commands to run once compiler is ready:
+  g++ -std=c++17 -I include src/ArenaAllocator.cpp tests/test_arena_allocator.cpp -o test_arena && ./test_arena
 
-**Next:**
-- Compile + unit test `FeatureExtractor.cpp` (currently reviewed but
-  untested).
-- Compile + unit test `ArenaAllocator` (currently written but untested).
-- After both are tested and passing: `FlatHashMap`.
-- Still need: one `head -n 2` sample from `imp.06.txt`, for when we reach
-  the offline Python label-joining pipeline (not blocking yet).
+**Phase 1, Step 2 tests also written: `tests/test_feature_extractor.cpp` (30 tests).**
+- NOT yet compiled or run — same compiler blocker.
+- Command:
+  g++ -std=c++17 -I include src/BidRequest.cpp src/FeatureExtractor.cpp tests/test_feature_extractor.cpp -o test_features && ./test_features
+- Day-of-week tests (Thursday/Monday/Sunday) are the canary for the mktime
+  timezone issue — if those 3 fail and everything else passes, the machine
+  timezone is not UTC+8 and the mktime caveat is a real problem, not just
+  theoretical. Flag it immediately if that happens.
 
+**Compiler situation:**
+- Mac: works as-is, use ./executable syntax
+- Windows (teammate): MinGW 6.3.0 — too old for C++17. Fix: install MSYS2,
+  run `pacman -S mingw-w64-x86_64-gcc`, add C:\msys64\mingw64\bin to PATH.
+  Context message for teammate already written and shared.
+
+**Progress estimate (as of this session):**
+- Done: BidRequest, FeatureExtractor, ArenaAllocator (code + tests)
+- Remaining C++: FlatHashMap, FTRLModel, BidCalculator, BudgetTracker,
+  FloorGate, main request loop wiring
+- Remaining Python: feature engineering, FTRL trainer, weight serializer,
+  regret verification
+- Estimate: ~10-15 more sessions at current pace to working v1
+
+**Next session starts with:**
+1. Compile and run all 3 test suites (BidRequest, FeatureExtractor, ArenaAllocator)
+2. Fix any failures
+3. Then: FlatHashMap (mental model first, then code)
 ---
 
 *Update this file after every significant decision or implementation milestone.*
