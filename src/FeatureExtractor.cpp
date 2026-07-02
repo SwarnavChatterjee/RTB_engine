@@ -82,7 +82,7 @@ FeatureVector extract_features(const BidRequest& req) {
         t.tm_isdst = -1;          // let mktime figure out DST
 
         std::mktime(&t);          // fills t.tm_wday as a side effect
-        v[kDayOfWeek] = static_cast<double>(t.tm_wday + 6) % 7;  // 0=Sun, 6=Sat
+        v[kDayOfWeek] = static_cast<double>((t.tm_wday + 6) % 7);  // 0=Sun, 6=Sat
     }
 
     // -----------------------------------------------------------------------
@@ -135,7 +135,7 @@ FeatureVector extract_features(const BidRequest& req) {
     // Raw numeric passthrough for now (see CLAUDE.md open question — may need
     // hashing like visibility/format once that's investigated).
     // -----------------------------------------------------------------------
-    v[kExchangeId]    = static_cast<double>(req.ad_exchange);
+    v[kExchangeId]    = static_cast<double>(req.adexchange);
     v[kAdvertiserId]  = static_cast<double>(req.advertiser_id);
     v[kRegion]        = static_cast<double>(req.region);
     v[kCity]          = static_cast<double>(req.city);
