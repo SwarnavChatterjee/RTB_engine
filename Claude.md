@@ -2,7 +2,7 @@
 
 > **Purpose:** Paste this file at the start of any AI conversation (Claude, GPT, Gemini, etc.)
 > to restore full project context instantly. Keep this file updated as the project evolves.
-> Last updated: 2026-06-22
+> Last updated: 2026-06-30
 
 ---
 
@@ -302,26 +302,69 @@ from scratch.
 
 ## 7. FEATURE VECTOR (canonical order — must match Python and C++)
 
+> **Corrected 2026-06-24, after research into real-world handling of this
+> exact dataset.** Original spec assumed `adslot_visibility`/`adslot_format`
+> were strings with known small enumerations, and mapped them manually.
+> We verified (Section 3) they're raw numeric codes in the real data, AND
+> confirmed via published research + the dataset-specific FeatureHashing R
+> package that the established practice for THIS dataset is to treat them
+> (and most other fields) as categorical and HASH them — not pass raw
+> codes through as if they were ordinal numbers. Passing a category code
+> straight into a linear model implies a false ordinal relationship
+> (format=4 is NOT "4x" of format=1) — this was a real correctness issue,
+> not just a simplification choice.
+
 ```
-Index | Feature          | Derived From        | Transform
-------|------------------|---------------------|---------------------------
-  0   | hour_of_day      | timestamp           | (ts / 10000000) % 100
-  1   | day_of_week      | timestamp           | parse date, compute weekday
-  2   | slot_area        | width * height      | integer multiply
-  3   | visibility_score | adslot_visibility   | FirstView=2, Second=1, NA=0
-  4   | format_id        | adslot_format       | Fixed=0,Pop=1,Bg=2,Float=3,NA=4
-  5   | domain_hash      | domain              | fnv1a(domain) % HASH_SIZE
-  6   | url_hash         | url                 | fnv1a(url) % HASH_SIZE
-  7   | visitor_hash     | visitor_id          | fnv1a(visitor_id) % HASH_SIZE
-  8   | floor_ratio      | floor_price         | floor_price / global_mean_floor
-  9   | is_mobile        | user_agent          | contains("Mobile") ? 1 : 0
-  10  | exchange_id      | adexchange          | direct (uint32)
-  11  | advertiser_id    | advertiser_id       | direct (uint32)
-  12  | region           | region              | direct (uint32)
-  13  | city             | city                | direct (uint32)
+Index | Feature          | Derived From           | Transform
+------|------------------|------------------------|---------------------------
+  0   | hour_of_day      | timestamp              | (ts / 10000000) % 100
+  1   | day_of_week      | timestamp              | parse date, compute weekday
+  2   | slot_area        | width * height         | integer multiply
+  3   | visibility_hash  | adslot_visibility_code | hash("vis:" + code) % HASH_SIZE
+                                                     (CHANGED from manual mapping —
+                                                      code is categorical, not ordinal)
+  4   | format_hash      | adslot_format_code     | hash("fmt:" + code) % HASH_SIZE
+                                                     (CHANGED — same reasoning as above)
+  5   | domain_hash      | domain                 | fnv1a(domain) % HASH_SIZE
+  6   | url_hash         | url                    | fnv1a(url) % HASH_SIZE
+  7   | visitor_hash     | visitor_id             | fnv1a(visitor_id) % HASH_SIZE
+  8   | floor_ratio      | floor_price            | floor_price / GLOBAL_MEAN_FLOOR_PLACEHOLDER
+                                                     (PLACEHOLDER constant for v1 — see note below)
+  9   | is_mobile        | user_agent             | case-insensitive contains("mobile") ? 1 : 0
+                                                     (CHANGED to case-insensitive — real samples
+                                                      showed inconsistent casing: lowercase in one
+                                                      bid.txt sample, capitalized in another)
+  10  | exchange_id      | adexchange             | direct (uint32)
+  11  | advertiser_id    | advertiser_id          | direct (uint32)
+  12  | region           | region                 | direct (uint32)
+  13  | city             | city                   | direct (uint32)
 ```
 
 **HASH_SIZE = 2^18 = 262144** (tunable — larger reduces collisions, increases memory)
+
+**GLOBAL_MEAN_FLOOR_PLACEHOLDER:** v1 uses a hardcoded placeholder constant
+(exact value TBD when we write the code) instead of a real dataset-wide
+mean. This is a known, deliberate stand-in — must be replaced with a value
+actually computed from training data (days 06-10) once the offline Python
+pipeline exists. Don't forget to revisit this — flagged here so it isn't
+silently treated as final.
+
+**Open question, not yet resolved:** `region`, `city`, `advertiser_id`,
+`exchange_id` are currently "direct (uint32)" passthrough, same as the
+OLD design for visibility/format. The same research that corrected
+visibility/format (FeatureHashing R package, published papers on this
+dataset) actually treats region/city/advertiser_id as categorical/hashed
+too, not passed through raw. We have NOT yet revisited this for v1 — it's
+a known simplification, not a verified-correct choice. Revisit if time
+allows; flagged here so it isn't forgotten or assumed settled.
+
+**CONFIRMED via real data, 2026-06-24 (10 real sample lines checked across
+bid.txt and clk.txt):** visibility_code takes values {0,1,2}, format_code
+takes values {0,1,5}. Format jumping straight to 5 (skipping 2,3,4 in our
+small sample) strongly implies the true category count is at least 6,
+of which we've only randomly seen 3. This definitively confirms neither
+field is binary, and decisively settles the hashing decision above — keep
+both hashed. Do not re-open this without new contradicting evidence.
 
 ---
 
@@ -558,14 +601,164 @@ new info):**
   expected and correct for this project's goal (learning, not just output).
 
 **In Progress:**
-- Nothing — Step 1 fully verified end-to-end on local machine, committed to git.
+- **Phase 1, Step 2: `FeatureExtractor`**
+  - `FeatureExtractor.hpp` COMPLETE — `FeatureVector` type (`std::array<double,14>`),
+    `FeatureIndex` enum naming each of the 14 box positions, `kHashSize`,
+    `extract_features()` declared. No failure mode (unlike parsing) —
+    every valid `BidRequest` always produces a feature vector.
+  - `FeatureExtractor.cpp` skeleton delivered (TODOs only, not yet
+    implemented): `fnv1a_hash`, `hash_to_bucket`, `is_mobile_user_agent`,
+    and the 14-field body of `extract_features`.
+  - User about to write `fnv1a_hash` (standard 32-bit FNV-1a recipe,
+    given as spec — offset basis 2166136261, prime 16777619 — not
+    designed from scratch, a known algorithm).
+  - NOT yet compiled/tested — skeleton only, logic not yet written.
+
+**Decisions made during Phase 1 Step 2 (locked in):**
+- `visibility_code` and `format_code` (cols 15/16 in bid.txt) are HASHED
+  into the same 262144-bucket space as domain/url/visitor_id — NOT passed
+  through as raw numbers, and NOT one-hot encoded. Reasoning: passing a
+  category code straight into a linear model implies false ordinality
+  (format=5 is not "5x" format=1). Confirmed via research (FeatureHashing
+  R package + published papers built specifically for this dataset both
+  hash these fields) AND via direct evidence: checked 10 real sample lines
+  across bid.txt/clk.txt, found visibility ∈ {0,1,2}, format ∈ {0,1,5} —
+  format jumping straight to 5 strongly implies ≥6 true categories, of
+  which we'd only randomly seen 3. Neither field is binary; the
+  false-ordinality concern is real, not theoretical. Don't re-open this
+  without new contradicting evidence — see Section 7 for full data table.
+- `floor_ratio` (index 8) uses a hardcoded placeholder constant
+  (`kGlobalMeanFloorPlaceholder`, currently 50.0, NOT yet verified against
+  real data) instead of a true dataset-wide mean. MUST be replaced once
+  the offline Python pipeline can compute the real mean from training
+  days 06-10. Flagged in code comments too — don't forget this.
+- `is_mobile` (index 9) does a case-INsensitive substring check for
+  "mobile". Real sample user-agent strings showed inconsistent casing
+  (lowercase in some bid.txt rows, capitalized "Mobile" in others) —
+  a case-sensitive check would silently miss real mobile traffic.
+- OPEN / not yet decided: `region`, `city`, `advertiser_id`, `exchange_id`
+  still use direct (uint32) passthrough in the current design — the same
+  research that corrected visibility/format suggests these might need the
+  same hashing treatment, but this has NOT been investigated or decided
+  yet. Flagged, not forgotten — revisit if time allows.
+
+---
+
+**Phase 1, Step 2 COMPLETE: `FeatureExtractor.cpp` implemented and reviewed.**
+
+- `fnv1a_hash`: standard 32-bit FNV-1a (offset basis 2166136261, prime
+  16777619), iterates over `unsigned char` to avoid signed-char overflow
+  bugs. Verified correct.
+- `hash_to_bucket`: `fnv1a_hash(data) % kHashSize`. Shared helper used by
+  domain/url/visitor/visibility/format hashing.
+- `is_mobile_user_agent`: builds a lowercase copy of the user-agent via
+  `tolower` (cast to `unsigned char` first, same overflow reasoning as
+  the hash), then does a substring `find` for "mobile". Known minor
+  inefficiency: allocates a heap string per call, on the hot path. Not
+  fixed yet — flagged as a profiling target, not urgent for v1. If it
+  ever shows up in a profiler, switch to a manual case-insensitive
+  comparison loop to avoid the allocation.
+- `kHourOfDay`: `(timestamp / 10'000'000) % 100` — strips the 7-digit
+  `mmssSSS` suffix, then isolates the 2-digit `HH`.
+- `kDayOfWeek`: implemented via `std::tm` + `mktime`, NOT custom calendar
+  math. Year/month/day sliced from the `yyyyMMdd` prefix of the
+  timestamp (`tm_year = year-1900`, `tm_mon = month-1`), `mktime` called
+  to normalise and populate `tm_wday` as a side effect.
+  - **Convention fix (locked in):** `tm_wday` is C convention
+    (Sun=0...Sat=6), but the project spec requires Python's `weekday()`
+    convention (Mon=0...Sun=6) to keep C++ inference and Python training
+    in exact parity. Conversion applied: `(tm_wday + 6) % 7`. Verified:
+    Sun(0)→6, Mon(1)→0, ..., Sat(6)→5. This conversion must be applied
+    wherever `tm_wday` is read — don't forget it if this logic is ever
+    touched again.
+  - **Known limitation, accepted for v1 (not a bug to fix now):**
+    `mktime` interprets the broken-down time as LOCAL time, not UTC.
+    IPinYou timestamps are presumed Beijing time (UTC+8); `mktime` does
+    not know this and uses the OS timezone instead. This can
+    mis-categorize `kDayOfWeek` by exactly one day, only for rows near
+    midnight boundaries where the local-vs-source timezone offset
+    crosses a calendar day. Decision: accepted as a documented
+    assumption rather than fixed now, because (a) it only affects a
+    small fraction of rows, (b) the model just learns slightly shifted
+    day-of-week weights rather than failing, and (c) the correct fix
+    (`timegm` or manual Zeller's-formula date math) is not portable
+    (`timegm` is POSIX-only, unavailable on MSVC) and not worth the
+    rabbit hole unless training/serving machines have inconsistent
+    timezones. **If train and serve ever run on machines with different
+    timezones, revisit this — that's the condition that would actually
+    cause a problem.**
+- `kVisibilityHash` / `kFormatHash`: numeric codes are stringified with a
+  prefix (`"vis:" + to_string(code)`, `"fmt:" + to_string(code)`) before
+  hashing, specifically to prevent visibility code N and format code N
+  from colliding in the same bucket space.
+- `kDomainHash` / `kUrlHash` / `kVisitorHash`: direct `hash_to_bucket()`
+  calls on the respective string_view fields.
+- `kFloorRatio`: `floor_price / kGlobalMeanFloorPlaceholder` as specified.
+- `kIsMobile`: `is_mobile_user_agent(user_agent) ? 1.0 : 0.0`.
+- `kExchangeId` / `kAdvertiserId` / `kRegion` / `kCity`: raw passthrough,
+  matching the still-open decision noted above.
+- **Architectural note for `FTRLModel` (when we get there, don't forget
+  this):** hashed features (domain/url/visitor/visibility/format) are
+  stored as `double` bucket IDs in the `FeatureVector`, but they are NOT
+  meant to be used as raw numeric values in a standard dot product —
+  they are lookup keys/indices into a weight array. This is correct as
+  designed in the extractor; the constraint is on how `FTRLModel` must
+  interpret them. Must be handled correctly when `FTRLModel` is built —
+  flagged now so it isn't missed later.
+- Status: code written and reviewed in detail (logically reviewed,
+  walked through manually). **NOT yet compiled or unit tested.** Next
+  concrete step before moving on: compile + run through `tests/` the
+  same way `BidRequest` was, with edge cases (midnight timestamps,
+  mobile/Mobile casing, max-size hash inputs).
+
+---
+
+**Phase 1, Step 3 IN PROGRESS: `ArenaAllocator`**
+
+- Mental model established: per-request bump allocator. One heap slab
+  allocated once at construction (`new char[capacity]`), a single
+  `offset_` cursor that advances on each `allocate()`, and `reset()`
+  which just sets `offset_ = 0` — O(1) "free everything," no
+  individual-object bookkeeping, because every object allocated during
+  one bid request shares the same lifetime (the request itself).
+- Backing memory location decided: **heap**, not stack or static/global.
+  Stack ruled out (size limits, compile-time-constant requirement, risk
+  of overflow). Static/global ruled out (data race risk if v2 ever adds
+  concurrency — see Section 2b). Heap allocation happens once in the
+  constructor; the per-request cost that matters is just pointer
+  arithmetic afterward.
+- Overflow handling decided: **`assert`, not `nullptr` and not
+  `bad_alloc`.** Reasoning: arena size is a known, fixed parameter
+  chosen upfront based on expected per-request memory needs; overflow
+  represents a sizing bug to catch in testing, not a runtime condition
+  to gracefully handle on the hot path. `nullptr` requires every caller
+  to remember to check (easy to forget, crashes later and far from the
+  cause). `bad_alloc` adds exception-handling overhead on a 5ms-budget
+  hot path. `assert` is zero-cost in release builds and fails loudly in
+  debug/test builds — standard pattern in game engines / HFT systems for
+  this exact bump-allocator use case.
+- `.hpp` and `.cpp` written (deviated from strict block-by-block working
+  mode this once — written in full, with a complete manual dry run
+  walked through instead, covering: unaligned single-byte alloc, aligned
+  8-byte double alloc showing padding bytes, aligned 4-byte alloc with
+  no padding needed, `reset()` behavior (cursor only, memory NOT zeroed
+  — callers must not assume clean memory after reset), and an overflow
+  case triggering the assert). Class is non-copyable (`= delete` on copy
+  ctor/assign) since two arenas sharing one slab would be a correctness
+  bug.
+- Key implementation detail to remember: alignment is done via bitmask
+  rounding — `(addr + alignment - 1) & ~(alignment - 1)` — which only
+  works correctly when `alignment` is a power of two (true for all
+  realistic alignments: 1, 2, 4, 8, 16...).
+- **Not yet compiled or tested.** Still need a
+  `tests/test_arena_allocator.cpp` following the same pattern as
+  `BidRequest`'s test suite before this is considered done.
 
 **Next:**
-- Phase 1, Step 2: `FeatureExtractor` — transforms raw `BidRequest` fields
-  (including the `_code` fields) into the canonical feature vector defined
-  in Section 7. This is the piece that actually touches feature hashing.
-  Same block-by-block working mode applies.
-- Then `ArenaAllocator`, `FlatHashMap`, with unit tests for each.
+- Compile + unit test `FeatureExtractor.cpp` (currently reviewed but
+  untested).
+- Compile + unit test `ArenaAllocator` (currently written but untested).
+- After both are tested and passing: `FlatHashMap`.
 - Still need: one `head -n 2` sample from `imp.06.txt`, for when we reach
   the offline Python label-joining pipeline (not blocking yet).
 
