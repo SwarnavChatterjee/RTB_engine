@@ -42,3 +42,12 @@ g++ -std=c++17 -I include \
     src/FloorGate.cpp \
     tests/test_floorgate.cpp \
     -o test_floorgate && ./test_floorgate
+
+
+# ------------------------------
+# FTRLModel Tests
+# ------------------------------
+g++ -std=c++17 -I include \
+    src/FTRLModel.cpp \
+    tests/test_ftrl_model.cpp \
+    -o test_ftrl && ./test_ftrl
