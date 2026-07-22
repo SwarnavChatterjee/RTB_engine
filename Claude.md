@@ -2,7 +2,7 @@
 
 > **Purpose:** Paste this file at the start of any AI conversation (Claude, GPT, Gemini, etc.)
 > to restore full project context instantly. Keep this file updated as the project evolves.
-> Last updated: 2026-06-30
+> Last updated: 2026-07-23
 
 ---
 
@@ -744,13 +744,407 @@ new info):**
   regret verification
 - Estimate: ~10-15 more sessions at current pace to working v1
 
+---
+
+**MAJOR DESIGN CHANGE: Feature Representation Overhaul (locked in)**
+
+Old design (WRONG): `FeatureVector = std::array<double, 14>`
+- Mixed semantics: some doubles were raw values, some were bucket IDs
+- `predict()` doing `score += w[i] * v[i]` is wrong for hashed categoricals
+  (bucket ID 182341 is not "182341 units of domain")
+
+New design (CORRECT): `FeatureVector = std::array<Feature, 14>` where:
+```cpp
+struct Feature {
+    uint32_t bucket{};
+    double   value{};
+};
+```
+Every feature is a (bucket, value) pair. predict() has one rule:
+```cpp
+score += w_[f.bucket] * f.value;
+```
+No branching, no special cases, no feature-type checks anywhere.
+
+Reserved bucket space (collision-proof):
+```cpp
+constexpr uint32_t kReservedBuckets = 32;  // buckets 0-31 reserved
+enum ReservedBucket : uint32_t {
+    kSlotAreaBucket   = 0,
+    kFloorRatioBucket = 1,
+    kIsMobileBucket   = 2,
+};
+```
+Hashed categoricals land in [32, 262144). Fixed numeric/binary in [0,31].
+Can NEVER collide. Costs 0.01% of bucket space.
+
+Feature table (final, locked in):
+  HourOfDay     → categorical, hash("hr:N"),   value=1.0
+  DayOfWeek     → categorical, hash("dow:N"),  value=1.0
+  SlotArea      → numeric,     kSlotAreaBucket, value=log(w×h)
+  VisibilityHash→ categorical, hash("vis:N"),  value=1.0
+  FormatHash    → categorical, hash("fmt:N"),  value=1.0
+  DomainHash    → categorical, hash(domain),   value=1.0
+  UrlHash       → categorical, hash(url),      value=1.0
+  VisitorHash   → categorical, hash(visitor),  value=1.0
+  FloorRatio    → numeric,     kFloorRatioBucket, value=price/mean
+  IsMobile      → binary,      kIsMobileBucket, value=0 or 1
+  ExchangeId    → categorical, hash("exc:N"),  value=1.0
+  AdvertiserId  → categorical, hash("adv:N"),  value=1.0
+  Region        → categorical, hash("reg:N"),  value=1.0
+  City          → categorical, hash("cty:N"),  value=1.0
+
+Hour/DayOfWeek categorical: non-linear relationship (2am ≠ 0.08×noon).
+SlotArea uses log() to compress wide variance in pixel area.
+All IDs categorical: no ordinality (exchange 3 ≠ 3× exchange 1).
+FeatureIndex enum KEPT for array readability only — NOT bucket IDs.
+kFeatureCount = 14 as standalone constexpr AFTER FeatureIndex enum
+  (not inside enum — kFeatureCount is a count not an index, different type).
+
+Files changed this session:
+- include/FeatureExtractor.hpp — Feature struct, ReservedBucket enum,
+  FeatureIndex enum (readability only), kFeatureCount standalone constexpr
+- src/FeatureExtractor.cpp — full rewrite, cat_feature() helper,
+  hash_to_bucket() now offsets by kReservedBuckets
+
+test_feature_extractor.cpp OUTDATED — must rewrite before compiling.
+Old tests check v[x] == double. Now v[x] is Feature{bucket,value}.
+New tests must check v[x].bucket and v[x].value separately.
+
+---
+
+**FlatHashMap — DROPPED permanently.**
+Direct array indexing on kHashSize=262144 is strictly better.
+bucket IDs are dense and bounded. No hash map needed on top of that.
+Do not revisit without a genuinely unbounded key space use case.
+
+---
+
+**FTRLModel — COMPLETE: FTRLModel.hpp + FTRLModel.cpp written.**
+
+C++ engine is INFERENCE ONLY. Stores only w_ (~2MB, one array).
+Python trainer owns z, n, hyperparameters, full update rule (Algorithm 1).
+After training, Python serializes only w to binary file (numpy .tofile()).
+C++ loads it once at startup via load_weights(path).
+
+Design decisions:
+- Non-copyable (=delete), movable (=default) — 2MB accidental copy expensive
+- load_weights() returns bool, never throws — no exceptions on hot path
+- File size verified before reading — wrong kHashSize caught at startup
+- sigmoid clamped [-35,35] — beyond this exp() output indistinguishable
+  from 0/1 in double precision. Paper uses σ(a)=1/(1+exp(-a)).
+- predict() is one loop, no branching — (bucket,value) design pays off here
+- Heap-allocated via make_unique<FTRLModel>() at call site (~2MB on stack
+  would overflow; member of FTRLModel so lives wherever FTRLModel lives)
+
+Paper read: McMahan et al. 2013 "Ad Click Prediction: a View from the
+Trenches". Algorithm 1 is the exact update rule for Python trainer.
+Key insight: z is NOT just accumulated gradients — it includes σ*w
+correction term that makes L1 produce exact zeros (sparsity). Without z
+you get OGD. With z you get sparsity. That is the entire point of FTRL.
+Per-coordinate learning rates (n accumulator) are automatic — no extra
+code needed. Baked into the update rule itself.
+sigmoid [-35,35] clamp: paper proves beyond this range double precision
+cannot represent the difference from 0 or 1. Clamp is free performance.
+
+---
+
+**CVR Model Decision — LOCKED (2026-07-23). Drop CVR model. CTR-only.**
+
+Competition scoring: Score = Clicks + N × Conversions
+N per advertiser: 1458→0, 3358→2, 3386→0, 3427→0, 3476→10
+
+conv_06.txt alone: 43 conversions, ALL advertiser 3358. Too sparse to
+justify a CVR model on its own, and rather than burn a session aggregating
+the remaining 5 conv.txt files to confirm this, made the call directly:
+CTR-only + advertiser multipliers captures the scoring-weight intent (N)
+without the fragility of training on thin, concentrated conversion data.
+
+Decision: use CTR-only bidding (see Bidding Architecture below).
+Do NOT re-open this without new data — if the remaining conv.txt files
+are ever aggregated and show thousands of conversions spread across
+advertisers, that would be new information worth revisiting this against,
+but absent that, this is final for v1.
+
+---
+
+**Bidding Architecture — locked in. CVR decision above is now final, not pending.**
+
+### Pipeline order — REVISED (2026-07-23 Architecture Decision Record)
+
+Original order had `FloorGate` before `BidCalculator` (reject-early principle).
+This was changed. New locked order:
+
+```
+BidRequest
+    ↓
+FeatureExtractor      — pure transform, no I/O
+    ↓
+FTRLModel::predict()  — dot product + sigmoid → pCTR
+    ↓
+BidCalculator         — pCTR → candidate bid (SOLE source of truth for pricing)
+    ↓
+FloorGate             — candidate bid vs floor_price → pass/reject
+    ↓
+BudgetManager         — budget/pacing check → pass/reject
+    ↓
+BidResponse
+```
+
+**Why this changed (ADR):** `FTRLModel::predict()` outputs pCTR, a probability
+in `[0,1]`. The exchange floor is a monetary bid price. A probability cannot
+be compared directly to a price, so a `FloorGate` placed before pricing would
+be forced to partially reimplement the bid formula (`pCTR × multiplier × 1000`)
+just to get a comparable number — creating two independent copies of the
+pricing equation that could drift out of sync if the formula ever changes.
+
+**Resolution:** `BidCalculator` runs first and is the only place the pricing
+formula lives. `FloorGate` no longer knows about pCTR or multipliers at all —
+it only compares an already-computed bid against a floor. This means the bid
+is computed even for requests ultimately rejected by the floor check, but that
+cost is a few FLOPs (measured: `BidCalculator` avg 8.48 ns/op — see Benchmark
+Baseline below), negligible next to feature extraction (~100 μs) and
+completely dwarfed by the risk of two pricing formulas silently diverging.
+
+**Tradeoff being made explicitly:** this reverses the original "don't compute
+the bid price if you're not going to bid" reject-early principle. That
+principle is a real micro-efficiency; single-source-of-truth pricing is a
+correctness/maintainability guarantee. Chose correctness over micro-efficiency
+here because the wasted computation is provably negligible (benchmarked, not
+assumed) while a pricing-formula split-brain bug would not be caught by any
+test — it would just silently produce wrong bids whenever someone updated one
+copy of the formula and not the other.
+
+Bid formula v1 (CTR-only, owned exclusively by `BidCalculator`):
+```
+bid = predicted_ctr × advertiser_multiplier × kBidScaleFactor (1000.0)
+```
+  advertiser_multiplier: configurable per advertiser, informed by N,
+  tuned experimentally on validation set. N is scoring weight not money.
+  Do NOT set multiplier = N directly.
+  advertiser_multiplier is a per-call argument, NOT stored as class state —
+  `BidCalculator` is a pure, stateless, static function for testability.
+  Config loading (`budget_config.json`) belongs to the orchestrator
+  (`BiddingEngine`), not to `BidCalculator` itself.
+
+Floor check v1 (owned exclusively by `FloorGate`):
+```
+passes = candidate_bid >= floor_price   (>=, not >: an exact match clears)
+```
+  `FloorGate` knows nothing about pCTR, multipliers, or the bid formula.
+  `floor_price` (`uint32_t`) is promoted to `double` for comparison, not the
+  reverse — `double` has 52 bits of mantissa, exact for any `uint32_t` value
+  (no precision loss up to 2^53), so this direction of cast is lossless.
+  Both `BidCalculator::compute_bid()` and `FloorGate::passes()` are
+  `[[nodiscard]]` — both are pure functions with no side effects, so a
+  discarded return value is a bug, not a style nit.
+
+Budget v1: stop bidding when exhausted. No pacing. Pacing is v2.
+
+---
+
+**BidCalculator — COMPLETE: BidCalculator.hpp + BidCalculator.cpp written.**
+
+Split into declaration (.hpp) / definition (.cpp), matching project convention
+(same pattern as `BidRequest`, `FeatureExtractor`) — not header-only, per
+explicit decision to keep declaration and implementation separate everywhere.
+
+Design decisions:
+- Stateless static function — no config, no member state. `advertiser_multiplier`
+  passed per-call, not stored, so this stays pure and trivially testable.
+- `kBidScaleFactor = 1000.0` — named `constexpr`, not a magic number, since the
+  locked bid formula note explicitly calls out the `×1000` scale factor.
+  In-class `static constexpr` is implicitly inline since C++17 — no separate
+  out-of-line definition needed (verify on Mac/Apple Clang if link errors appear).
+- `[[nodiscard]]` on `compute_bid()` — pure function, no side effects, a
+  discarded return value can only be a caller bug.
+- Single source of truth for the pricing formula — see Pipeline order ADR
+  above for why this class exists before `FloorGate` in the pipeline.
+
+```cpp
+// include/BidCalculator.hpp
+class BidCalculator {
+public:
+    static constexpr double kBidScaleFactor = 1000.0;
+    [[nodiscard]] static double compute_bid(double predicted_ctr,
+                                             double advertiser_multiplier);
+};
+```
+```cpp
+// src/BidCalculator.cpp
+double BidCalculator::compute_bid(double predicted_ctr, double advertiser_multiplier) {
+    return predicted_ctr * advertiser_multiplier * BidCalculator::kBidScaleFactor;
+}
+```
+
+`tests/test_bid_calculator.cpp` written: basic formula correctness, zero-ctr
+and zero-multiplier edge cases, realistic small-pCTR values (0.001-0.05 range,
+not 0.5 — real FTRL output is small), monotonicity in both ctr and multiplier.
+
+---
+
+**FloorGate — COMPLETE: FloorGate.hpp + FloorGate.cpp written.**
+
+Split into declaration (.hpp) / definition (.cpp), same convention.
+
+Design decisions:
+- Takes an already-computed `candidate_bid` (from `BidCalculator`) and
+  `floor_price` — knows nothing about pCTR or multipliers (see Pipeline
+  order ADR above for why this ordering was chosen).
+- `>=` not `>` at the floor — an exact match clears. Business rule, not a
+  math fact; documented explicitly so it's a decision, not an accident.
+  Canary test exists for this (`test_floorgate.cpp`) — if this is ever
+  flipped to strict `>`, that test is the one that should fail first.
+- `static_cast<double>(floor_price)` promotes the floor up, not the bid
+  down — lossless (double exactly represents all uint32_t values).
+- `[[nodiscard]]` — same reasoning as `compute_bid()`.
+- Stateless static function — no per-advertiser data, no config. If a future
+  version needs a floor-tolerance epsilon buffer, that's the point where
+  this would need to become stateful — not now.
+- Does NOT log, count rejections, or know about budget — that's
+  `BudgetManager`'s job. Keeping this to one function is the actual
+  enforcement of single-responsibility, not just a claim in a comment.
+
+```cpp
+// include/FloorGate.hpp
+class FloorGate {
+public:
+    [[nodiscard]] static bool passes(double candidate_bid, uint32_t floor_price);
+};
+```
+```cpp
+// src/FloorGate.cpp
+bool FloorGate::passes(double candidate_bid, uint32_t floor_price) {
+    return candidate_bid >= static_cast<double>(floor_price);
+}
+```
+
+`tests/test_floorgate.cpp` written: basic pass/reject, exact-floor boundary
+(the `>=` canary), zero-floor edge cases, zero-bid-against-nonzero-floor,
+large `floor_price` near `uint32_t` range (precision check on the cast
+direction), fractional bid just under an integer floor.
+
+---
+
+**test_feature_extractor.cpp — REWRITTEN for Feature{bucket,value} design.**
+
+Previously flagged OUTDATED (old tests checked `v[x] == double`; current
+design is `v[x] == Feature{bucket, value}`). Rewritten from the actual
+`FeatureExtractor.cpp` implementation, not from memory of the old spec.
+
+Key design choices in the rewrite:
+- Independently re-implements `fnv1a_hash`/`hash_to_bucket` inside the test
+  file (deliberate duplication) so tests verify the EXACT bucket a key
+  hashes to, not just "some hash happened" — catches silent drift in the
+  FNV constants or reserved-bucket offset that a looser test would miss.
+- Structural invariants checked generically (all reserved-bucket features
+  use fixed IDs; all hashed categoricals land in `[kReservedBuckets, kHashSize)`;
+  all categorical values are exactly 1.0) — enforces the collision-proof
+  guarantee as a real check, not just a comment claim.
+- Day-of-week tests use 3 known dates (Mon/Thu/Sun) as an explicit timezone
+  canary: `mktime` uses local time (documented limitation). If all three
+  fail together while everything else passes, that's the signal the test
+  machine isn't in the expected timezone — not a logic bug.
+- Cross-field collision checks: same raw numeric code used for two different
+  fields (e.g. visibility=1 and format=1, or exchange=5 and region=5) must
+  NOT collide, proving the string-prefixing (`"vis:"`, `"fmt:"`, etc.) works.
+- Zero-area slot: `log(0)` edge case must map to `0.0`, never NaN/Inf.
+- Determinism check: same input string across two separate calls must
+  produce the same bucket.
+
+---
+
+**Benchmark Infrastructure — ADDED by Codex (2026-07-23). Not production code.**
+
+New `benchmarks/` directory, separate from `tests/` — keeps timing code
+isolated from correctness tests, and from production code entirely.
+
+Contents:
+- `benchmarks/BenchmarkCommon.hpp` — shared timing helpers, formatting,
+  output utilities, constants. Avoids every benchmark reimplementing its
+  own timer/printer.
+- `benchmarks/FeatureExtractorBenchmark.cpp` — benchmarks `extract_features(req)`
+- `benchmarks/BidRequestBenchmark.cpp` — benchmarks parsing, isolated from
+  the rest of the engine
+- `benchmarks/BidCalculatorBenchmark.cpp` — benchmarks `compute_bid(...)`
+- `benchmarks/FloorGateBenchmark.cpp` — benchmarks `passes(...)`
+- `benchmarks/FTRLBenchmark.cpp` — benchmarks `predict(...)` (dot product +
+  weight lookup + sigmoid, isolated from the rest of inference)
+
+**Pipeline benchmark deliberately NOT created** (`bench_pipeline.cpp`) —
+correctly recognized the full orchestrator
+(`BidRequest → FeatureExtractor → FTRLModel → BidCalculator → FloorGate →
+BudgetManager → Decision`) doesn't exist as a wired-together path yet.
+Right call: not inventing infrastructure that doesn't exist rather than
+faking a pipeline benchmark against stubs.
+
+Methodology (same across all benchmarks):
+- Warm-up phase (thousands of iterations) before measurement, reduces
+  cold-start effects
+- 1,000,000 measured iterations per benchmark
+- Setup (building the request, etc.) excluded from the timed section
+- Release build confirmed: `-O3 -DNDEBUG`
+- No I/O inside the timed section
+- Reports: total time, ns/op, μs/op, throughput
+
+Benchmark-quality issues found and flagged (not production bugs):
+1. Only 2 of 14 extracted features were being consumed by the benchmark
+   sink — risk that the compiler could eliminate "unused" work as dead
+   code. Fix: consume all 14 features.
+2. Sink was updated every iteration inside the timed loop. Fix: accumulate
+   a local checksum inside the loop, write to the `volatile` sink once
+   after timing — avoids the update itself distorting the measurement.
+
+Build integration: benchmarks compile through CMake now (new targets added,
+existing production/test targets untouched), output to `build/` instead of
+polluting the repo root. No more manual `g++` invocation for these.
+
+**Performance baseline established (2026-07-23) — first official numbers,
+future optimizations measured against this:**
+
+| Module | Avg latency |
+|---|---|
+| FeatureExtractor | 100.728 μs |
+| BidRequest (parse) | 540 ns |
+| BidCalculator | 8.48 ns |
+| FloorGate | 2.50 ns |
+| FTRLModel (predict) | 9.06 ns |
+
+Confirmed by review: no production logic, algorithms, `FeatureExtractor`,
+`BidRequest`, `FTRLModel`, or unit tests were changed — benchmark
+infrastructure and CMake additions only.
+
+Interpretation: `FeatureExtractor` is by far the dominant cost (100+ μs vs.
+single-digit-to-low-hundreds of ns for everything else) — if the 5ms p99
+latency budget is ever at risk, this is where to look first, not
+`BidCalculator`/`FloorGate`/`FTRLModel`, which are currently in the noise.
+
+---
+
+**Progress estimate (end of this session, 2026-07-23):**
+- Done: BidRequest, FeatureExtractor (v2 with Feature struct), ArenaAllocator,
+  FTRLModel (hpp+cpp), BidCalculator (hpp+cpp), FloorGate (hpp+cpp)
+- Dropped: FlatHashMap, CVR model (locked decision, CTR-only — see above)
+- Tests done: test_bid_calculator.cpp, test_floorgate.cpp,
+  test_feature_extractor.cpp (rewritten for Feature{bucket,value})
+- Benchmarks done (Codex): BenchmarkCommon.hpp + 5 module benchmarks +
+  CMake integration + performance baseline (see table above)
+- Remaining C++: BudgetManager, main loop wiring / orchestrator (needed
+  before a pipeline benchmark makes sense)
+- Remaining tests: test_ftrl_model.cpp, test_budget_manager.cpp (once written)
+- Remaining Python: feature engineering, FTRL trainer (Algorithm 1),
+  weight serializer, progressive validation
+- Estimate: ~5-7 more sessions to working v1
+
 **Next session starts with:**
-1. Compile and run all 3 test suites (BidRequest, FeatureExtractor, ArenaAllocator)
-2. Fix any failures
-3. Then: FlatHashMap (mental model first, then code)
+1. BudgetManager (last gating component before orchestration)
+2. write test_budget_manager.cpp
+3. write test_ftrl_model.cpp (still outstanding from before)
+4. Once all gating components exist: wire the orchestrator
+   (`BiddingEngine`) so a real `bench_pipeline.cpp` becomes possible
+
 ---
 
 *Update this file after every significant decision or implementation milestone.*
 *When starting a new AI chat: paste this entire file as your first message.*
-*For personal learning notes (not project state), see docs/LEARNING_LOG.md
-— that file is updated separately, after each session, in the user's own words.*
+*For personal learning notes and mistakes+solutions, see LEARNING_LOG.md.*

@@ -29,3 +29,41 @@ enable_testing()
 add_executable(test_bid_request tests/test_bid_request.cpp)
 target_link_libraries(test_bid_request PRIVATE rtb_engine)
 add_test(NAME test_bid_request COMMAND test_bid_request)
+
+# --- Benchmarks ---
+# These targets intentionally live outside the production library and existing
+# test targets. Runtime outputs are placed in CMake's binary directory.
+add_executable(benchmark_feature_extractor
+    benchmarks/FeatureExtractorBenchmark.cpp
+    src/FeatureExtractor.cpp
+    src/BidRequest.cpp
+)
+target_link_libraries(benchmark_feature_extractor PRIVATE rtb_engine)
+
+add_executable(benchmark_bid_request
+    benchmarks/BidRequestBenchmark.cpp
+    src/BidRequest.cpp
+)
+
+add_executable(benchmark_bid_calculator
+    benchmarks/BidCalculatorBenchmark.cpp
+    src/BidCalculator.cpp
+)
+
+add_executable(benchmark_floor_gate
+    benchmarks/FloorGateBenchmark.cpp
+    src/FloorGate.cpp
+)
+
+add_executable(benchmark_ftrl_model
+    benchmarks/FTRLModelBenchmark.cpp
+)
+
+foreach(benchmark_target
+        benchmark_feature_extractor
+        benchmark_bid_request
+        benchmark_bid_calculator
+        benchmark_floor_gate
+        benchmark_ftrl_model)
+    target_include_directories(${benchmark_target} PRIVATE include benchmarks)
+endforeach()

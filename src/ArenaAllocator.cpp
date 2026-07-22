@@ -19,8 +19,8 @@ void* ArenaAllocator::allocate(size_t size, size_t alignment) {
     // Step 1: find the next address that satisfies alignment.
     // Current address is slab_ + offset_.
     // We need to round it UP to the nearest multiple of alignment.
-    size_t current_addr = reinterpret_cast<size_t>(slab_ + offset_);
-    size_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1);
+    size_t current_addr = reinterpret_cast<size_t>(slab_ + offset_); //type changing to int
+    size_t aligned_addr = (current_addr + alignment - 1) & ~(alignment - 1); //alignment of types
 
     // Step 2: how many padding bytes did alignment require?
     size_t padding = aligned_addr - current_addr;
