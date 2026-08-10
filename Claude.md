@@ -1121,27 +1121,215 @@ latency budget is ever at risk, this is where to look first, not
 
 ---
 
-**Progress estimate (end of this session, 2026-07-23):**
-- Done: BidRequest, FeatureExtractor (v2 with Feature struct), ArenaAllocator,
-  FTRLModel (hpp+cpp), BidCalculator (hpp+cpp), FloorGate (hpp+cpp)
-- Dropped: FlatHashMap, CVR model (locked decision, CTR-only — see above)
-- Tests done: test_bid_calculator.cpp, test_floorgate.cpp,
-  test_feature_extractor.cpp (rewritten for Feature{bucket,value})
-- Benchmarks done (Codex): BenchmarkCommon.hpp + 5 module benchmarks +
-  CMake integration + performance baseline (see table above)
-- Remaining C++: BudgetManager, main loop wiring / orchestrator (needed
-  before a pipeline benchmark makes sense)
-- Remaining tests: test_ftrl_model.cpp, test_budget_manager.cpp (once written)
-- Remaining Python: feature engineering, FTRL trainer (Algorithm 1),
-  weight serializer, progressive validation
-- Estimate: ~5-7 more sessions to working v1
+---
+
+**FeatureExtractor hot-path optimization — COMPLETE (this session)**
+
+Eliminated all per-request heap allocations from `extract_features()`:
+- Replaced all `"prefix:" + std::to_string(x)` with `cat_feature_int()`
+  helper that uses `snprintf` into a 16-byte stack buffer. Zero heap.
+- `is_mobile_user_agent()` now uses a fixed 512-byte stack buffer + `strstr`
+  instead of `std::string` + `find`. Zero heap.
+- `#include <string>` removed from FeatureExtractor.cpp entirely —
+  `std::string` is gone from the hot path.
+- All 34 feature extractor tests still pass after the change. Verified
+  before committing — hash values unchanged because key strings are identical,
+  just constructed on stack instead of heap.
+
+Arena allocator architectural review conclusion (this session):
+- Only 9-12 heap allocations per request existed, all in `extract_features`.
+- Stack buffer fix eliminates them without needing the arena at all.
+- Arena remains in codebase for v2 (multi-threaded, protobuf parsing, etc).
+- Do NOT wire arena into hot path for v1 — stack buffers are simpler and
+  faster for this scale.
+
+---
+
+**BudgetManager — COMPLETE: BudgetManager.hpp + BudgetManager.cpp written.**
+
+All amounts in fen (1/100 CNY) — uint32_t throughout, no floating point.
+Flat arrays of 5 slots, linear scan via index_of() — faster than hash map
+at this scale, fits in one cache line.
+
+Design decisions locked in:
+- Strict loading: fails if unknown advertiser ID, duplicate ID, or any of
+  the 5 known advertisers missing. Partial load = Python pipeline bug → fail loud.
+- `can_bid(id)` checks `remaining > 0` only — does NOT take a bid amount.
+  Rationale: called before BidCalculator in pipeline; bid amount not yet known.
+  Caller must additionally check `remaining >= bid_amount` before record_spend.
+- `record_spend()`: debug assert fires if amount > remaining (pipeline bug),
+  release build clamps silently (production safety net).
+- `remaining()` is single source of truth for `budgets_[i] - spent_[i]` —
+  used internally by can_bid() and record_spend() to avoid duplication.
+- `reset()`: zeros spent_ only, budgets_ unchanged — for multi-day eval runs.
+- `std::fill` not `memset` — type-safe, identical codegen.
+- `index_of()` is static — no this pointer, pure lookup.
+- Non-copyable, movable.
+
+Budget source: Python `compute_budgets.py` aggregates PayingPrice from
+imp.06-10.txt per advertiser → outputs `models/budgets.txt` as:
+  `advertiser_id budget_fen\n` per line.
+BudgetManager loads this at startup. NOT hardcoded — README gives no budget
+values, so they must be computed from actual training spend data.
+
+test_budget_manager.cpp: 27 tests — load_budgets (8), can_bid (5),
+record_spend (5), remaining (3), reset (3), pipeline simulation (2).
+All 27 pass. Warnings only: nodiscard on setup calls (acceptable, same
+pattern as other test files).
+
+---
+
+**test_ftrl_model.cpp — COMPLETE. 20 tests, all pass.**
+
+sigmoid (4), load_weights (5), predict (9), move semantics (1).
+Missing `#include <string>` caused initial compile failure — added and fixed.
+nodiscard warnings on setup calls — accepted, same as other test files.
+
+---
+
+**Pipeline order ADR — CORRECTED and locked.**
+
+Original planned order: FloorGate → BudgetManager → BidCalculator
+  (reject-early: don't compute bid if floor will reject)
+
+Actual correct order: BidCalculator → FloorGate → BudgetManager
+  Reason: FloorGate compares `candidate_bid >= floor_price`. It needs the
+  computed bid to do this comparison. Placing FloorGate before BidCalculator
+  would require duplicating the pricing formula inside FloorGate — violating
+  single-responsibility. BidCalculator is 8.48ns (benchmark), so the "wasted"
+  compute on floor-rejected requests is negligible. Correct architecture beats
+  micro-optimization here.
+
+Locked pipeline:
+  parse_bid_request()
+      ↓
+  extract_features()
+      ↓
+  FTRLModel::predict()        — dot product + sigmoid
+      ↓
+  BidCalculator::compute_bid() — pCTR × multiplier × 1000
+      ↓
+  FloorGate::passes()          — candidate_bid >= floor_price?
+      ↓
+  BudgetManager::can_bid()     — remaining > 0?
+      ↓
+  return bid price or -1
+
+---
+
+**BiddingEngine — COMPLETE: BiddingEngine.hpp + BiddingEngine.cpp written.**
+
+Top-level orchestrator. Owns FTRLModel and BudgetManager. Wires the full
+pipeline. Core method is get_bid_price(line) → int32_t.
+
+Key decisions:
+- Returns -1 for: parse failure, floor rejection, budget exhaustion.
+- record_spend() NOT called inside get_bid_price() — in offline evaluation
+  the evaluator tells you if you won after the fact. In a real system a
+  win notification would trigger it. For now budget tracking is read-only
+  during bidding in the engine; record_spend() must be called externally
+  when a win is confirmed.
+- Multipliers are v1 starting points (not = N directly):
+    1458: 1.0 (N=0, clicks only)
+    3358: 1.2 (N=2, conversions worth 2x)
+    3386: 1.0 (N=0)
+    3427: 1.0 (N=0)
+    3476: 1.5 (N=10, bid more aggressively)
+  These must be tuned on validation set once weights exist.
+- Non-copyable, non-movable — owns large model state.
+- run() reads stdin line by line, writes one integer per line to stdout.
+- Missing `#include <iostream>` caused initial compile error — fixed.
+
+main.cpp written. Usage:
+  ./rtb_engine models/weights.bin models/budgets.txt < dataset/bid.11.txt
+
+Compile command:
+  g++ -std=c++17 -O2 -I include \
+      src/BidRequest.cpp src/FeatureExtractor.cpp src/FTRLModel.cpp \
+      src/BidCalculator.cpp src/FloorGate.cpp src/BudgetManager.cpp \
+      src/BiddingEngine.cpp src/main.cpp -o rtb_engine
+
+Engine compiles and runs but produces no output currently — expected,
+because models/weights.bin and models/budgets.txt don't exist yet.
+These are produced by the Python offline pipeline (next phase).
+
+---
+
+**C++ engine — FULLY COMPLETE for v1.**
+
+All components written, tested, and compiled:
+  BidRequest (parse) ✅
+  ArenaAllocator ✅
+  FeatureExtractor (heap-free hot path) ✅
+  FTRLModel (inference only) ✅
+  BidCalculator ✅
+  FloorGate ✅
+  BudgetManager ✅
+  BiddingEngine (orchestrator) ✅
+  main.cpp ✅
+
+All tests passing:
+  test_bid_request ✅
+  test_arena_allocator ✅
+  test_feature_extractor (34 tests) ✅
+  test_ftrl_model (20 tests) ✅
+  test_bid_calculator ✅
+  test_floorgate ✅
+  test_budget_manager (27 tests) ✅
+
+Performance baseline (release build, -O3 -DNDEBUG):
+  FeatureExtractor: 100.728 μs (dominant cost — heap-free fix may improve)
+  BidRequest parse: 540 ns
+  BidCalculator:    8.48 ns
+  FloorGate:        2.50 ns
+  FTRLModel predict: 9.06 ns
+  Full pipeline:    not yet benchmarked (engine now wired — run next session)
+
+---
+
+**NEXT PHASE: Python offline pipeline.**
+
+Nothing more to build in C++ until weights and budgets exist.
+
+Files to write (in order):
+1. `python/compute_budgets.py`
+   - Reads imp.06.txt through imp.10.txt
+   - Aggregates PayingPrice per advertiser_id
+   - Outputs models/budgets.txt
+   - Run this first — BudgetManager needs it immediately
+
+2. `python/data_loader.py`
+   - Joins bid.txt + clk.txt by BidID
+   - Produces (features, label) pairs for training
+   - label = 1 if BidID appears in clk.txt, else 0
+
+3. `python/feature_engineering.py`
+   - Python mirror of FeatureExtractor.cpp
+   - MUST produce identical bucket IDs for identical inputs
+   - Same FNV-1a constants, same kReservedBuckets=32 offset,
+     same prefixes (hr:, dow:, vis:, fmt:, exc:, adv:, reg:, cty:)
+   - Same log(area) transform, same floor_ratio formula
+   - This file is the most critical — any drift from C++ = silent wrong predictions
+
+4. `python/ftrl_train.py`
+   - Implements Algorithm 1 from McMahan et al. 2013
+   - Hyperparameters: alpha=0.1, beta=1.0, lambda1=1e-6, lambda2=1e-5
+     (starting points from published IPinYou papers — tune on validation)
+   - Trains on days 06-10, validates on day 11
+   - Outputs models/weights.bin via numpy.array(w, dtype=float64).tofile()
+   - Progressive validation: log LogLoss every 100k examples
+
+5. `python/evaluate.py`
+   - Runs ./rtb_engine against bid.11.txt and bid.12.txt
+   - Computes Score = Clicks + N × Conversions per advertiser
+   - Compares against budget constraints
+   - Reports final score
 
 **Next session starts with:**
-1. BudgetManager (last gating component before orchestration)
-2. write test_budget_manager.cpp
-3. write test_ftrl_model.cpp (still outstanding from before)
-4. Once all gating components exist: wire the orchestrator
-   (`BiddingEngine`) so a real `bench_pipeline.cpp` becomes possible
+1. compute_budgets.py (unblocks BudgetManager testing with real data)
+2. feature_engineering.py (most critical — must match C++ exactly)
+3. ftrl_train.py (Algorithm 1)
+4. Run end-to-end: train → generate weights → run engine → score
 
 ---
 
