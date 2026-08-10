@@ -18,7 +18,7 @@ namespace rtb {
 // by static index. O(1) for every operation. Linear scan over 5 elements
 // beats a hash map at this scale — fits in one cache line.
 //
-// Thread safety: NONE. Single-threaded use only for v1.
+// Thread safety: NONE. Single-threaded use only for v1. //very important for performance.RN
 // If v2 adds concurrent request handling, add mutex around record_spend()
 // and can_bid(), or switch spent_ to std::atomic<uint32_t>.
 //
